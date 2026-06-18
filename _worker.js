@@ -19,6 +19,7 @@ let cfip = [ // 格式:优选域名:端口#备注名称、优选IP:端口#备注
 ];  // 在此感谢各位大佬维护的优选域名
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
+const CLASH_TEST_URL = 'https://www.gstatic.com/generate_204';
 function closeSocketQuietly(socket) { 
     try { 
         if (socket.readyState === WS_READY_STATE_OPEN || socket.readyState === WS_READY_STATE_CLOSING) {
@@ -30,6 +31,221 @@ function closeSocketQuietly(socket) {
 function formatIdentifier(arr, offset = 0) {
     const hex = [...arr.slice(offset, offset + 16)].map(b => b.toString(16).padStart(2, '0')).join('');
     return `${hex.substring(0,8)}-${hex.substring(8,12)}-${hex.substring(12,16)}-${hex.substring(16,20)}-${hex.substring(20)}`;
+}
+
+function getCleanSubPath() {
+    return String(subPath || yourUUID).replace(/^\/+/, '');
+}
+
+function isTrojanDisabled() {
+    if (typeof disabletro === 'boolean') return disabletro;
+    return ['true', '1', 'yes', 'on'].includes(String(disabletro).trim().toLowerCase());
+}
+
+function parseCdnItem(cdnItem) {
+    let item = String(cdnItem || '').trim();
+    let host = item;
+    let port = 443;
+    let nodeName = '';
+
+    if (item.includes('#')) {
+        const parts = item.split('#');
+        item = parts[0];
+        nodeName = parts.slice(1).join('#');
+    }
+
+    if (item.startsWith('[') && item.includes(']:')) {
+        const ipv6End = item.indexOf(']:');
+        host = item.substring(0, ipv6End + 1);
+        port = parseInt(item.substring(ipv6End + 2), 10) || 443;
+    } else if (item.includes(':')) {
+        const parts = item.split(':');
+        host = parts[0];
+        port = parseInt(parts[1], 10) || 443;
+    } else {
+        host = item;
+    }
+
+    return { host, port, nodeName };
+}
+
+function uniqueNodeName(baseName, nameCounts) {
+    const count = nameCounts.get(baseName) || 0;
+    nameCounts.set(baseName, count + 1);
+    return count === 0 ? baseName : `${baseName} ${count + 1}`;
+}
+
+function yamlValue(value) {
+    return JSON.stringify(String(value));
+}
+
+function yamlList(items, indent = 6) {
+    const spaces = ' '.repeat(indent);
+    return items.map(item => `${spaces}- ${yamlValue(item)}`).join('\n');
+}
+
+function buildClashProxy(proxy) {
+    const lines = [
+        `  - name: ${yamlValue(proxy.name)}`,
+        `    type: ${proxy.type}`,
+        `    server: ${yamlValue(proxy.server)}`,
+        `    port: ${proxy.port}`,
+    ];
+
+    if (proxy.type === 'vless') {
+        lines.push(
+            `    uuid: ${yamlValue(yourUUID)}`,
+            '    tls: true',
+            `    servername: ${yamlValue(proxy.domain)}`,
+            '    network: ws',
+            '    udp: true',
+            '    packet-encoding: xudp',
+            '    client-fingerprint: firefox',
+            '    skip-cert-verify: true',
+            '    ws-opts:',
+            '      path: "/?ed=2560"',
+            '      headers:',
+            `        Host: ${yamlValue(proxy.domain)}`
+        );
+    } else {
+        lines.push(
+            `    password: ${yamlValue(yourUUID)}`,
+            '    udp: true',
+            `    sni: ${yamlValue(proxy.domain)}`,
+            '    network: ws',
+            '    client-fingerprint: firefox',
+            '    skip-cert-verify: true',
+            '    ws-opts:',
+            '      path: "/?ed=2560"',
+            '      headers:',
+            `        Host: ${yamlValue(proxy.domain)}`
+        );
+    }
+
+    return lines.join('\n');
+}
+
+function buildClashGroup(name, type, proxies, extraLines = []) {
+    return [
+        `  - name: ${yamlValue(name)}`,
+        `    type: ${type}`,
+        ...extraLines.map(line => `    ${line}`),
+        `    url: ${yamlValue(CLASH_TEST_URL)}`,
+        '    interval: 300',
+        '    lazy: false',
+        '    proxies:',
+        yamlList(proxies)
+    ].join('\n');
+}
+
+function getClashConfig(currentDomain) {
+    const nameCounts = new Map();
+    const proxies = [];
+
+    cfip.forEach(cdnItem => {
+        const { host, port, nodeName } = parseCdnItem(cdnItem);
+        const vlessName = uniqueNodeName(`${nodeName || 'Workers'}-vless`, nameCounts);
+        proxies.push({ name: vlessName, type: 'vless', server: host, port, domain: currentDomain });
+
+        if (!isTrojanDisabled()) {
+            const trojanName = uniqueNodeName(`${nodeName || 'Workers'}-trojan`, nameCounts);
+            proxies.push({ name: trojanName, type: 'trojan', server: host, port, domain: currentDomain });
+        }
+    });
+
+    const proxyNames = proxies.map(proxy => proxy.name);
+    const selectProxies = ['DIRECT', 'REJECT', '♻️ 自动选择', ...proxyNames];
+    const routeProxies = ['🚀 节点选择', 'DIRECT', 'REJECT', '♻️ 自动选择', ...proxyNames];
+    const proxyBlocks = proxies.map(buildClashProxy).join('\n');
+    const groups = [
+        buildClashGroup('🚀 节点选择', 'select', selectProxies),
+        buildClashGroup('♻️ 自动选择', 'url-test', proxyNames, ['tolerance: 50']),
+        buildClashGroup('🏠 私有网络', 'select', routeProxies),
+        buildClashGroup('🔒 国内服务', 'select', routeProxies),
+        buildClashGroup('🌏 非中国', 'select', routeProxies),
+        buildClashGroup('🐟 漏网之鱼', 'select', routeProxies),
+    ].join('\n');
+
+    const yaml = `port: 7890
+socks-port: 7891
+allow-lan: false
+mode: rule
+log-level: info
+geodata-mode: true
+geo-auto-update: true
+geodata-loader: standard
+geo-update-interval: 24
+geox-url:
+  geoip: https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat
+  geosite: https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat
+  mmdb: https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/country.mmdb
+  asn: https://github.com/xishang0128/geoip/releases/download/latest/GeoLite2-ASN.mmdb
+rule-providers:
+  geolocation-cn:
+    type: http
+    format: mrs
+    behavior: domain
+    url: https://gh-proxy.com/https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/geolocation-cn.mrs
+    path: ./ruleset/geolocation-cn.mrs
+    interval: 86400
+  cn:
+    type: http
+    format: mrs
+    behavior: ipcidr
+    url: https://gh-proxy.com/https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geoip/cn.mrs
+    path: ./ruleset/cn.mrs
+    interval: 86400
+  geolocation-!cn:
+    type: http
+    format: mrs
+    behavior: domain
+    url: https://gh-proxy.com/https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/geolocation-!cn.mrs
+    path: ./ruleset/geolocation-!cn.mrs
+    interval: 86400
+  private:
+    type: http
+    format: mrs
+    behavior: ipcidr
+    url: https://gh-proxy.com/https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geoip/private.mrs
+    path: ./ruleset/private.mrs
+    interval: 86400
+dns:
+  enable: true
+  ipv6: true
+  respect-rules: true
+  enhanced-mode: fake-ip
+  nameserver:
+    - https://120.53.53.53/dns-query
+    - https://223.5.5.5/dns-query
+  proxy-server-nameserver:
+    - https://120.53.53.53/dns-query
+    - https://223.5.5.5/dns-query
+  nameserver-policy:
+    geosite:cn,private:
+      - https://120.53.53.53/dns-query
+      - https://223.5.5.5/dns-query
+    geosite:geolocation-!cn:
+      - https://dns.cloudflare.com/dns-query
+      - https://dns.google/dns-query
+proxies:
+${proxyBlocks}
+proxy-groups:
+${groups}
+rules:
+  - RULE-SET,geolocation-cn,🔒 国内服务
+  - RULE-SET,cn,🔒 国内服务
+  - RULE-SET,geolocation-!cn,🌏 非中国
+  - RULE-SET,private,🏠 私有网络,no-resolve
+  - RULE-SET,cn,🔒 国内服务,no-resolve
+  - MATCH,🐟 漏网之鱼
+`;
+
+    return new Response(yaml, {
+        headers: {
+            'Content-Type': 'text/yaml; charset=utf-8',
+            'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+        },
+    });
 }
 
 function base64ToArray(b64Str) {
@@ -224,6 +440,7 @@ export default {
             
             const url = new URL(request.url);
             const pathname = url.pathname;
+            const cleanSubPath = getCleanSubPath();
             
             let pathProxyIP = null;
             if (pathname.startsWith('/proxyip=')) {
@@ -260,8 +477,12 @@ export default {
                 if (url.pathname === '/') {
                     return getHomePage(request);
                 }
+
+                if (url.pathname.toLowerCase() === `/clash/${cleanSubPath.toLowerCase()}`) {
+                    return getClashConfig(url.hostname);
+                }
                 
-                if (url.pathname.toLowerCase().includes(`/${subPath.toLowerCase()}`)) {
+                if (url.pathname.toLowerCase().includes(`/${cleanSubPath.toLowerCase()}`)) {
                     const currentDomain = url.hostname;
                     const vlsHeader = 'v' + 'l' + 'e' + 's' + 's';
                     const troHeader = 't' + 'r' + 'o' + 'j' + 'a' + 'n';
@@ -294,7 +515,7 @@ export default {
                     
                     // 生成 Tro-jan 节点
                     let allLinks = [...vlsLinks];
-                    if (!disabletro) {
+                    if (!isTrojanDisabled()) {
                         const troLinks = cfip.map(cdnItem => {
                             let host, port = 443, nodeName = '';
                             if (cdnItem.includes('#')) {
@@ -364,7 +585,7 @@ async function handleVlsRequest(request, customProxyIP) {
                 return;
             }
             
-            if (!disabletro) {
+            if (!isTrojanDisabled()) {
                 const trojanResult = await parsetroHeader(chunk, yourUUID);
                 if (!trojanResult.hasError) {
                     isTrojan = true;
@@ -1391,7 +1612,7 @@ function getMainPageContent(url, baseUrl) {
             </div>
             <div class="info-item">
                 <span class="label">Clash订阅地址</span>
-                <span class="value">https://sublink.eooce.com/clash?config=${baseUrl}/${subPath}</span>
+                <span class="value">${baseUrl}/clash/${subPath}</span>
             </div>
             <div class="info-item">
                 <span class="label">singbox订阅地址</span>
@@ -1478,7 +1699,7 @@ function getMainPageContent(url, baseUrl) {
         }
         
         function copyClashSubscription() {
-            const clashUrl = 'https://sublink.eooce.com/clash?config=${baseUrl}/${subPath}';
+            const clashUrl = '${baseUrl}/clash/${subPath}';
             navigator.clipboard.writeText(clashUrl).then(() => {
                 showToast('Clash订阅链接已复制到剪贴板!');
             }).catch(() => {
