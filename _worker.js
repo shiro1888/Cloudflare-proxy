@@ -154,7 +154,7 @@ function getClashConfig(currentDomain) {
     });
 
     const proxyNames = proxies.map(proxy => proxy.name);
-    const selectProxies = ['DIRECT', 'REJECT', '♻️ 自动选择', ...proxyNames];
+    const selectProxies = ['♻️ 自动选择', ...proxyNames];
     const routeProxies = ['🚀 节点选择', 'DIRECT', 'REJECT', '♻️ 自动选择', ...proxyNames];
     const proxyBlocks = proxies.map(buildClashProxy).join('\n');
     const groups = [
